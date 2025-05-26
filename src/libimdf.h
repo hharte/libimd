@@ -19,6 +19,10 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* --- Error Codes for libimdf --- */
 #define IMDF_ERR_OK              0  /* Success */
 #define IMDF_ERR_WRITE_PROTECTED -100 /* Operation failed: Image is write-protected */
@@ -247,5 +251,52 @@ int find_sector_index_internal(const ImdTrackInfo* track, uint8_t logical_sector
  * @return 0 on success, -1 if the sector size is not found in the lookup table.
  */
 int get_sector_size_code(uint32_t sector_size, uint8_t* code_out);
+
+/**
+ * Formats (or re-formats) an entire track with specific sector numbering.
+ * Creates the track if it doesn't exist, inserting it in C/H order.
+ * If overwriting, the existing track data is replaced.
+ * The sector numbering (smap) is generated according to the first_sector_id
+ * and interleave parameters, with sector IDs wrapping around num_sectors.
+ * All sectors in the formatted track will be filled with fill_byte and
+ * initially marked to allow compression if the fill_byte results in uniform data.
+ * Changes are persisted immediately to the file.
+ *
+ * @param imdf Pointer to the ImdImageFile handle.
+ * @param cyl Physical cylinder number for the track.
+ * @param head Physical head number for the track.
+ * @param mode The IMD mode (e.g., IMD_MODE_MFM_250) for this track.
+ * @param num_sectors Number of sectors for the track (0-255).
+ * @param sector_size Size in bytes for each sector (must be a valid IMD size).
+ * @param first_sector_id The logical ID of the first sector to be written in the track's smap.
+ * Sector IDs are typically 1-based and go up to num_sectors.
+ * @param interleave The interleave factor used to determine the sequence of logical
+ * sector IDs laid out on the physical track.
+ * @param skew The offset from physical sector 0.
+ * @param fill_byte Byte value used to fill the data buffer for all sectors.
+ * @return IMDF_ERR_OK on success.
+ * @return IMDF_ERR_INVALID_ARG if imdf is NULL or parameters are invalid (e.g. num_sectors too large, invalid sector_size, first_sector_id out of range).
+ * @return IMDF_ERR_WRITE_PROTECTED if the image is write-protected.
+ * @return IMDF_ERR_GEOMETRY if cyl/head exceeds limits.
+ * @return IMDF_ERR_SECTOR_SIZE if the specified sector_size is invalid.
+ * @return IMDF_ERR_ALLOC on memory allocation failure.
+ * @return IMDF_ERR_IO on file write error during persistence.
+ * @return IMDF_ERR_LIBIMD_ERR on internal libimd errors.
+ */
+int imdf_format_track(ImdImageFile* imdf,
+    uint8_t cyl,
+    uint8_t head,
+    uint8_t mode,
+    uint8_t num_sectors,
+    uint32_t sector_size,
+    uint8_t first_sector_id,
+    int interleave,
+    int skew,
+    uint8_t fill_byte);
+
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
 
 #endif /* LIBIMDF_H */

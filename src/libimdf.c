@@ -905,3 +905,281 @@ cleanup_inserterror:
     }
     return result;
 }
+
+/*
+ * Helper function to generate the sector map (smap) based on the
+ * specified formatting rules (first_sector_id, interleave, and skew).
+ * The generated smap defines the physical layout of logical sector IDs.
+ */
+static void generate_formatted_smap(uint8_t* smap_out,
+                                    uint8_t num_sectors,
+                                    uint8_t first_sector_id,
+                                    int interleave,
+                                    int skew) {
+    if (num_sectors == 0) {
+        return;
+    }
+
+    uint8_t temp_smap[LIBIMD_MAX_SECTORS_PER_TRACK];
+    uint8_t current_id;
+
+    DEBUG_PRINTF("generate_formatted_smap: nsec=%u, first_id=%u, il=%d, skew=%d\n",
+        num_sectors, first_sector_id, interleave, skew);
+
+    /* Generate the base (interleaved) map into a temporary buffer */
+    if (interleave == 1) {
+        for (int i = 0; i < num_sectors; i++) {
+            temp_smap[i] = first_sector_id + i;
+        }
+    }
+    else {
+        int base_rows = num_sectors / interleave;
+        int extra_rows = num_sectors % interleave;
+        uint8_t col_starts[LIBIMD_MAX_SECTORS_PER_TRACK];
+
+        col_starts[0] = first_sector_id;
+        for (int i = 1; i < interleave; i++) {
+            col_starts[i] = col_starts[i - 1] + base_rows + (i <= extra_rows ? 1 : 0);
+        }
+
+        for (int i = 0; i < num_sectors; i++) {
+            int row = i / interleave;
+            int col = i % interleave;
+            temp_smap[i] = col_starts[col] + row;
+        }
+    }
+
+    /*
+     * Apply skew by determining the starting logical sector ID.
+     * The skew value is added to the first_sector_id to get the
+     * actual first sector in the sequence.
+     */
+    current_id = first_sector_id + skew;
+
+    for (int i = 0; i < num_sectors; i++) {
+        smap_out[i] = current_id;
+        DEBUG_PRINTF("  smap[%d] = %u\n", i, smap_out[i]);
+
+        current_id++;
+        /* Wrap around if the ID exceeds the number of sectors */
+        if (current_id > num_sectors) {
+            current_id = first_sector_id;
+        }
+    }
+}
+
+int imdf_format_track(ImdImageFile* imdf,
+                      uint8_t cyl,
+                      uint8_t head,
+                      uint8_t mode,
+                      uint8_t num_sectors,
+                      uint32_t sector_size,
+                      uint8_t first_sector_id,
+                      int interleave,
+                      int skew,
+                      uint8_t fill_byte) {
+    int track_idx_int;
+    ImdTrackInfo* track_ptr = NULL;
+    int rewrite_res;
+    int result;
+    int existing_track = 0;
+    size_t insert_idx = 0;
+    uint8_t sector_size_code;
+    uint8_t generated_smap[LIBIMD_MAX_SECTORS_PER_TRACK];
+
+    /* Basic argument validation */
+    if (!imdf) {
+        return IMDF_ERR_INVALID_ARG;
+    }
+    if (imdf->write_protected) {
+        return IMDF_ERR_WRITE_PROTECTED;
+    }
+
+    /* Geometry validation */
+    if ((imdf->max_cyl != 0xFF && cyl > imdf->max_cyl) ||
+        (imdf->max_head != 0xFF && head > imdf->max_head)) {
+        DEBUG_PRINTF("Format Track Error: C%u/H%u exceeds geometry Cmax%u/Hmax%u\n",
+            cyl, head, imdf->max_cyl, imdf->max_head);
+        return IMDF_ERR_GEOMETRY;
+    }
+    if (imdf->max_spt != 0xFF && num_sectors > imdf->max_spt && num_sectors != 0) {
+         DEBUG_PRINTF("Format Track Error: num_sectors %u exceeds SptMax %u\n",
+            num_sectors, imdf->max_spt);
+        return IMDF_ERR_GEOMETRY;
+    }
+
+    /* Parameter validation */
+    if (mode >= LIBIMD_NUM_MODES) {
+        DEBUG_PRINTF("Format Track Error: Invalid mode %u\n", mode);
+        return IMDF_ERR_INVALID_ARG;
+    }
+    if (num_sectors > LIBIMD_MAX_SECTORS_PER_TRACK) {
+         DEBUG_PRINTF("Format Track Error: num_sectors %u exceeds LIBIMD_MAX_SECTORS_PER_TRACK %d\n",
+            num_sectors, LIBIMD_MAX_SECTORS_PER_TRACK);
+        return IMDF_ERR_INVALID_ARG;
+    }
+    if (get_sector_size_code(sector_size, &sector_size_code) != 0) {
+        DEBUG_PRINTF("Format Track Error: Invalid sector_size %u\n", sector_size);
+        return IMDF_ERR_SECTOR_SIZE;
+    }
+    if (num_sectors > 0 && (first_sector_id == 0 || first_sector_id > num_sectors)) {
+        DEBUG_PRINTF("Format Track Error: first_sector_id %u is invalid for num_sectors %u\n",
+            first_sector_id, num_sectors);
+        return IMDF_ERR_INVALID_ARG;
+    }
+    if (interleave < 1 || (num_sectors > 1 && interleave >= num_sectors)) {
+        /* Interleave must be at least 1. If num_sectors > 1, interleave cannot be >= num_sectors
+           as it would not be possible to pick 'interleave' distinct subsequent sectors.
+           If num_sectors is 1, any interleave >= 1 is fine.
+        */
+        if (num_sectors > 1 && interleave >= num_sectors) {
+             DEBUG_PRINTF("Format Track Error: interleave %d is invalid for num_sectors %u\n",
+                interleave, num_sectors);
+            return IMDF_ERR_INVALID_ARG;
+        }
+        if (interleave < 1) {
+            DEBUG_PRINTF("Format Track Error: interleave %d must be >= 1\n", interleave);
+            return IMDF_ERR_INVALID_ARG;
+        }
+    }
+    if (skew < 0 || skew >= num_sectors) {
+        DEBUG_PRINTF("Format Track Error: skew %d is invalid for num_sectors %u\n",
+            skew, num_sectors);
+        return IMDF_ERR_INVALID_ARG;
+    }
+
+    /* Generate the sector smap */
+    if (num_sectors > 0) {
+        generate_formatted_smap(generated_smap, num_sectors, first_sector_id, interleave, skew);
+    }
+
+    track_idx_int = find_track_index_internal(imdf, cyl, head);
+    existing_track = (track_idx_int >= 0);
+
+    if (existing_track) {
+        insert_idx = (size_t)track_idx_int;
+        DEBUG_PRINTF("Format Track: Overwriting existing track at index %zu (C%u H%u)\n",
+            insert_idx, cyl, head);
+        track_ptr = &imdf->tracks[insert_idx];
+        imd_free_track_data(track_ptr); /* Free old data if any */
+        memset(track_ptr, 0, sizeof(ImdTrackInfo)); /* Clear structure */
+    } else {
+        DEBUG_PRINTF("Format Track: Creating new track for C%u H%u\n", cyl, head);
+        insert_idx = find_insertion_index(imdf, cyl, head);
+
+        if (imdf->num_tracks >= imdf->track_capacity) {
+            size_t new_capacity = (imdf->track_capacity == 0) ?
+                                  IMDF_INITIAL_TRACK_CAPACITY : imdf->track_capacity * 2;
+            if (new_capacity <= imdf->track_capacity) { /* Overflow check */
+                result = IMDF_ERR_ALLOC;
+                goto cleanup_error;
+            }
+            ImdTrackInfo* new_tracks = (ImdTrackInfo*)realloc(imdf->tracks,
+                                                             new_capacity * sizeof(ImdTrackInfo));
+            if (!new_tracks) {
+                result = IMDF_ERR_ALLOC;
+                goto cleanup_error;
+            }
+            imdf->tracks = new_tracks;
+            imdf->track_capacity = new_capacity;
+            DEBUG_PRINTF("Format Track: Reallocated track array to %zu\n", new_capacity);
+        }
+
+        /* Make space for the new track if inserting in the middle */
+        if (insert_idx < imdf->num_tracks) {
+            memmove(&imdf->tracks[insert_idx + 1],
+                    &imdf->tracks[insert_idx],
+                    (imdf->num_tracks - insert_idx) * sizeof(ImdTrackInfo));
+        }
+
+        track_ptr = &imdf->tracks[insert_idx];
+        memset(track_ptr, 0, sizeof(ImdTrackInfo));
+        imdf->num_tracks++;
+    }
+
+    /* Populate the track structure */
+    track_ptr->cyl = cyl;
+    track_ptr->head = head;
+    track_ptr->mode = mode;
+    track_ptr->num_sectors = num_sectors;
+    track_ptr->sector_size_code = sector_size_code;
+    track_ptr->sector_size = sector_size; /* Will be set by imd_alloc_track_data too */
+    track_ptr->loaded = 1; /* Mark as loaded and ready to be written */
+    track_ptr->hflag = 0;  /* No optional cmap/hmap for a basic format */
+
+    if (num_sectors > 0) {
+        int alloc_res = imd_alloc_track_data(track_ptr);
+        if (alloc_res != 0) {
+            result = map_libimd_error(alloc_res);
+            goto cleanup_error;
+        }
+        memset(track_ptr->data, fill_byte, track_ptr->data_size);
+        memcpy(track_ptr->smap, generated_smap, num_sectors);
+
+        /* Fill default cmap and hmap (will not be written unless flags are set) */
+        for (uint8_t i = 0; i < num_sectors; ++i) {
+            track_ptr->cmap[i] = cyl;
+            track_ptr->hmap[i] = head;
+            track_ptr->sflag[i] = IMD_SDR_NORMAL; /* Default, will be adjusted by imd_write_track_imd */
+        }
+    } else {
+        track_ptr->data = NULL;
+        track_ptr->data_size = 0;
+    }
+
+    /* Prepare write options. Force compression will check if fill_byte made sectors uniform. */
+    ImdWriteOpts write_opts;
+    memcpy(&write_opts, &default_libimdf_write_opts, sizeof(ImdWriteOpts));
+    write_opts.compression_mode = IMD_COMPRESSION_FORCE_COMPRESS;
+    /* The interleave_factor in ImdWriteOpts is for libimd's re-interleaving,
+       which we don't want here as we've already built the specific smap.
+       So, use LIBIMD_IL_AS_READ. */
+    write_opts.interleave_factor = LIBIMD_IL_AS_READ;
+
+
+    rewrite_res = rewrite_image_file(imdf, insert_idx, &write_opts);
+    if (rewrite_res != IMDF_ERR_OK) {
+        result = rewrite_res;
+        goto cleanup_error;
+    }
+
+    /* After successful rewrite, update the in-memory sflag for the written track */
+    /* This is a prediction based on the fill_byte and FORCE_COMPRESS option */
+    if (num_sectors > 0 && track_ptr->data) {
+        uint8_t predicted_sdr_type = IMD_SDR_COMPRESSED; /* Assume fill_byte makes it compressible */
+        /* Check if all data is actually the fill_byte. If not, it's normal. */
+        for(size_t k=0; k < track_ptr->data_size; ++k) {
+            if(track_ptr->data[k] != fill_byte) {
+                predicted_sdr_type = IMD_SDR_NORMAL;
+                break;
+            }
+        }
+        for (uint8_t i = 0; i < track_ptr->num_sectors; ++i) {
+            track_ptr->sflag[i] = predicted_sdr_type;
+        }
+    }
+
+    return IMDF_ERR_OK;
+
+cleanup_error:
+    DEBUG_PRINTF("Format Track: Cleaning up after error %d during %s track\n",
+        result, existing_track ? "overwrite of" : "insertion of new");
+    /* If it was a new track that failed, remove it from the array */
+    if (!existing_track && track_ptr == &imdf->tracks[insert_idx]) {
+        imd_free_track_data(track_ptr); /* Free data if allocated for the new track */
+        if (insert_idx < imdf->num_tracks -1 ) { /* Check if it's not the last element before moving */
+             memmove(&imdf->tracks[insert_idx],
+                    &imdf->tracks[insert_idx + 1],
+                    (imdf->num_tracks - 1 - insert_idx) * sizeof(ImdTrackInfo));
+        }
+        imdf->num_tracks--;
+    } else if (existing_track && track_ptr) {
+        /* If overwriting an existing track failed, its state might be partial.
+           Best to re-load or close/re-open the image.
+           For now, its data is freed and struct zeroed. It might be an empty shell.
+        */
+        DEBUG_PRINTF("Format Track: Overwrite for C%u H%u failed. In-memory track is now empty/cleared.\n",
+            cyl, head);
+    }
+    return result;
+}
