@@ -53,6 +53,7 @@ struct ImdImageFile {
     char* file_path;            /* Stored path for potential reopening */
     int write_protected;        /* Write protection status */
     int read_only_open;         /* Was the file opened with read_only flag? */
+    int file_owner;             /* 1 if libimdf should close the file, 0 otherwise */
 
     ImdHeaderInfo header_info;  /* Parsed header info */
     char* comment;              /* Comment block */
@@ -295,7 +296,6 @@ int get_sector_size_code(uint32_t sector_size, uint8_t* code_out) {
 int imdf_open(const char* path, int read_only, ImdImageFile** imdf_out) {
     FILE* f = NULL;
     ImdImageFile* imdf = NULL;
-    int libimd_err;
     int result;
 
     if (!path || !imdf_out) {
@@ -303,6 +303,7 @@ int imdf_open(const char* path, int read_only, ImdImageFile** imdf_out) {
     }
     *imdf_out = NULL;
 
+    /* 1. Open the file. */
     const char* mode = read_only ? "rb" : "r+b";
     f = fopen(path, mode);
     if (!f) {
@@ -310,53 +311,86 @@ int imdf_open(const char* path, int read_only, ImdImageFile** imdf_out) {
         return IMDF_ERR_CANNOT_OPEN;
     }
 
+    /* 2. Delegate the core reading logic to imdf_open_from_file. */
+    result = imdf_open_from_file(f, read_only, &imdf);
+
+    if (result != IMDF_ERR_OK) {
+        /* If the core logic failed, close the file we opened and return the error. */
+        fclose(f);
+        *imdf_out = NULL; /* Ensure output is NULL on failure */
+        return result;
+    }
+
+    /*
+     * 3. On success, populate the fields that this function is responsible for.
+     */
+    imdf->file_owner = 1; /* This function opened the file, so it must close it. */
+    imdf->file_path = strdup(path); /* Store the path. */
+
+    if (!imdf->file_path) {
+        /* Allocation for path failed, this is a critical error. */
+        imdf_close(imdf); /* imdf_close will handle everything correctly. */
+        *imdf_out = NULL;
+        return IMDF_ERR_ALLOC;
+    }
+
+    /* All good. */
+    *imdf_out = imdf;
+    return IMDF_ERR_OK;
+}
+
+int imdf_open_from_file(FILE* f, int read_only, ImdImageFile** imdf_out) {
+    ImdImageFile* imdf = NULL;
+    int libimd_err;
+    int result;
+
+    if (!f || !imdf_out) {
+        return IMDF_ERR_INVALID_ARG;
+    }
+    *imdf_out = NULL;
+
+    /*
+     * Rewind the stream to the beginning. The stream must be seekable.
+     */
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        return IMDF_ERR_IO;
+    }
+
     imdf = (ImdImageFile*)calloc(1, sizeof(ImdImageFile));
     if (!imdf) {
-        fclose(f);
         return IMDF_ERR_ALLOC;
     }
 
     imdf->file_ptr = f;
     imdf->read_only_open = (read_only != 0);
-    imdf->write_protected = (read_only != 0); /* Initially protected if opened read-only */
-    imdf->max_cyl = 0xFF; /* Unused by default */
-    imdf->max_head = 0xFF;/* Unused by default */
-    imdf->max_spt = 0xFF; /* Unused by default */
+    imdf->write_protected = (read_only != 0);
+    imdf->file_owner = 0; /* The caller owns the file handle. */
+    imdf->file_path = NULL; /* No path is associated with the stream. */
 
-    /* Store file path */
-    imdf->file_path = strdup(path);
-    if (!imdf->file_path) {
-        result = IMDF_ERR_ALLOC;
-        goto cleanup_error;
-    }
+    /*
+     * Initialize geometry limits.
+     */
+    imdf->max_cyl = 0xFF;
+    imdf->max_head = 0xFF;
+    imdf->max_spt = 0xFF;
 
-    /* Read Header */
+    /*
+     * Read Header, Comment, and Track data.
+     */
     libimd_err = imd_read_file_header(imdf->file_ptr, &imdf->header_info, NULL, 0);
     if (libimd_err != 0) {
         result = map_libimd_error(libimd_err);
-        DEBUG_PRINTF("imdf_open: imd_read_file_header failed (%d)\n", libimd_err);
         goto cleanup_error;
     }
 
-    /* Read Comment */
     imdf->comment = imd_read_comment_block(imdf->file_ptr, &imdf->comment_len);
-
     if (imdf->comment == NULL) {
-        if (ferror(imdf->file_ptr)) {
-            DEBUG_PRINTF("imdf_open: I/O error after imd_read_comment_block returned NULL.\n");
-            result = IMDF_ERR_IO;
-        }
-        else {
-            DEBUG_PRINTF("imdf_open: imd_read_comment_block returned NULL (alloc error or EOF before comment terminator?).\n");
-            result = IMDF_ERR_LIBIMD_ERR;
-        }
+        result = ferror(imdf->file_ptr) ? IMDF_ERR_IO : IMDF_ERR_LIBIMD_ERR;
         goto cleanup_error;
     }
 
-    /* Read Tracks */
     imdf->num_tracks = 0;
     imdf->track_capacity = IMDF_INITIAL_TRACK_CAPACITY;
-
     imdf->tracks = (ImdTrackInfo*)malloc(imdf->track_capacity * sizeof(ImdTrackInfo));
     if (!imdf->tracks) {
         result = IMDF_ERR_ALLOC;
@@ -365,22 +399,15 @@ int imdf_open(const char* path, int read_only, ImdImageFile** imdf_out) {
     memset(imdf->tracks, 0, imdf->track_capacity * sizeof(ImdTrackInfo));
 
 
-    DEBUG_PRINTF("imdf_open: Reading tracks...\n");
+    DEBUG_PRINTF("imdf_open_from_file: Reading tracks...\n");
     while (1) {
         if (imdf->num_tracks >= imdf->track_capacity) {
             size_t new_capacity = imdf->track_capacity * 2;
-            if (new_capacity <= imdf->track_capacity) {
-                result = IMDF_ERR_ALLOC;
-                goto cleanup_error;
-            }
+            if (new_capacity <= imdf->track_capacity) { result = IMDF_ERR_ALLOC; goto cleanup_error; }
             ImdTrackInfo* new_tracks = (ImdTrackInfo*)realloc(imdf->tracks, new_capacity * sizeof(ImdTrackInfo));
-            if (!new_tracks) {
-                result = IMDF_ERR_ALLOC;
-                goto cleanup_error;
-            }
+            if (!new_tracks) { result = IMDF_ERR_ALLOC; goto cleanup_error; }
             imdf->tracks = new_tracks;
             imdf->track_capacity = new_capacity;
-            DEBUG_PRINTF("imdf_open: Reallocated track array to %zu\n", new_capacity);
         }
 
         ImdTrackInfo* current_track = &imdf->tracks[imdf->num_tracks];
@@ -388,19 +415,10 @@ int imdf_open(const char* path, int read_only, ImdImageFile** imdf_out) {
         libimd_err = imd_load_track(imdf->file_ptr, current_track, LIBIMD_FILL_BYTE_DEFAULT);
 
         if (libimd_err == 1) { /* Success */
-            DEBUG_PRINTF("  Loaded track %zu: C%u H%u Ns%u Sz%u Code%u Mode%u Hflag0x%02X\n",
-                imdf->num_tracks, current_track->cyl, current_track->head,
-                current_track->num_sectors, current_track->sector_size,
-                current_track->sector_size_code, current_track->mode, current_track->hflag);
-
             imdf->num_tracks++;
-        }
-        else if (libimd_err == 0) { /* Clean EOF */
-            DEBUG_PRINTF("imdf_open: EOF reached after %zu tracks.\n", imdf->num_tracks);
+        } else if (libimd_err == 0) { /* Clean EOF */
             break;
-        }
-        else { /* Error */
-            DEBUG_PRINTF("imdf_open: imd_load_track failed (%d) for logical track %zu\n", libimd_err, imdf->num_tracks);
+        } else { /* Error */
             result = map_libimd_error(libimd_err);
             goto cleanup_error;
         }
@@ -410,7 +428,7 @@ int imdf_open(const char* path, int read_only, ImdImageFile** imdf_out) {
     return IMDF_ERR_OK;
 
 cleanup_error:
-    DEBUG_PRINTF("imdf_open: Cleaning up after error %d\n", result);
+    DEBUG_PRINTF("imdf_open_from_file: Cleaning up after error %d\n", result);
     if (imdf) {
         if (imdf->tracks) {
             for (size_t i = 0; i < imdf->num_tracks; ++i) {
@@ -421,13 +439,7 @@ cleanup_error:
         if (imdf->comment) {
             free(imdf->comment);
         }
-        if (imdf->file_path) {
-            free(imdf->file_path);
-        }
         free(imdf);
-    }
-    if (f) {
-        fclose(f);
     }
     *imdf_out = NULL;
     return result;
@@ -437,7 +449,7 @@ void imdf_close(ImdImageFile* imdf) {
     if (!imdf) {
         return;
     }
-    DEBUG_PRINTF("Closing image file: %s\n", imdf->file_path ? imdf->file_path : "(no path)");
+    DEBUG_PRINTF("Closing image file: %s\n", imdf->file_path ? imdf->file_path : "(from stream)");
     if (imdf->tracks) {
         for (size_t i = 0; i < imdf->num_tracks; ++i) {
             imd_free_track_data(&imdf->tracks[i]);
@@ -447,7 +459,7 @@ void imdf_close(ImdImageFile* imdf) {
     if (imdf->comment) {
         free(imdf->comment);
     }
-    if (imdf->file_ptr) {
+    if (imdf->file_ptr && imdf->file_owner) {
         fclose(imdf->file_ptr);
     }
     if (imdf->file_path) {
@@ -748,6 +760,7 @@ int imdf_write_sector(ImdImageFile* imdf, uint8_t cyl, uint8_t head, uint8_t log
 int imdf_write_track(ImdImageFile* imdf,
     uint8_t cyl,
     uint8_t head,
+    uint8_t mode,
     uint8_t num_sectors,
     uint32_t sector_size,
     uint8_t fill_byte,
@@ -822,7 +835,7 @@ int imdf_write_track(ImdImageFile* imdf,
     track_ptr->num_sectors = num_sectors;
     track_ptr->sector_size_code = sector_size_code;
     track_ptr->sector_size = sector_size;
-    track_ptr->mode = IMD_MODE_MFM_250; /* Default to a common mode */
+    track_ptr->mode = mode;
     track_ptr->loaded = 1;
 
     track_ptr->hflag = 0;
@@ -978,208 +991,46 @@ int imdf_format_track(ImdImageFile* imdf,
                       int interleave,
                       int skew,
                       uint8_t fill_byte) {
-    int track_idx_int;
-    ImdTrackInfo* track_ptr = NULL;
-    int rewrite_res;
-    int result;
-    int existing_track = 0;
-    size_t insert_idx = 0;
-    uint8_t sector_size_code;
+
     uint8_t generated_smap[LIBIMD_MAX_SECTORS_PER_TRACK];
+    uint8_t sector_size_code; /* For validation */
 
-    /* Basic argument validation */
-    if (!imdf) {
-        return IMDF_ERR_INVALID_ARG;
-    }
-    if (imdf->write_protected) {
-        return IMDF_ERR_WRITE_PROTECTED;
-    }
-
-    /* Geometry validation */
+    /*
+     * 1. Perform validation specific to formatting parameters.
+     */
+    if (!imdf) return IMDF_ERR_INVALID_ARG;
+    if (imdf->write_protected) return IMDF_ERR_WRITE_PROTECTED;
     if ((imdf->max_cyl != 0xFF && cyl > imdf->max_cyl) ||
         (imdf->max_head != 0xFF && head > imdf->max_head)) {
-        DEBUG_PRINTF("Format Track Error: C%u/H%u exceeds geometry Cmax%u/Hmax%u\n",
-            cyl, head, imdf->max_cyl, imdf->max_head);
         return IMDF_ERR_GEOMETRY;
     }
-    if (imdf->max_spt != 0xFF && num_sectors > imdf->max_spt && num_sectors != 0) {
-         DEBUG_PRINTF("Format Track Error: num_sectors %u exceeds SptMax %u\n",
-            num_sectors, imdf->max_spt);
-        return IMDF_ERR_GEOMETRY;
-    }
-
-    /* Parameter validation */
-    if (mode >= LIBIMD_NUM_MODES) {
-        DEBUG_PRINTF("Format Track Error: Invalid mode %u\n", mode);
-        return IMDF_ERR_INVALID_ARG;
-    }
-    if (num_sectors > LIBIMD_MAX_SECTORS_PER_TRACK) {
-         DEBUG_PRINTF("Format Track Error: num_sectors %u exceeds LIBIMD_MAX_SECTORS_PER_TRACK %d\n",
-            num_sectors, LIBIMD_MAX_SECTORS_PER_TRACK);
-        return IMDF_ERR_INVALID_ARG;
-    }
-    if (get_sector_size_code(sector_size, &sector_size_code) != 0) {
-        DEBUG_PRINTF("Format Track Error: Invalid sector_size %u\n", sector_size);
-        return IMDF_ERR_SECTOR_SIZE;
-    }
-    if (num_sectors > 0 && (first_sector_id == 0 || first_sector_id > num_sectors)) {
-        DEBUG_PRINTF("Format Track Error: first_sector_id %u is invalid for num_sectors %u\n",
-            first_sector_id, num_sectors);
-        return IMDF_ERR_INVALID_ARG;
-    }
-    if (interleave < 1 || (num_sectors > 1 && interleave >= num_sectors)) {
-        /* Interleave must be at least 1. If num_sectors > 1, interleave cannot be >= num_sectors
-           as it would not be possible to pick 'interleave' distinct subsequent sectors.
-           If num_sectors is 1, any interleave >= 1 is fine.
-        */
-        if (num_sectors > 1 && interleave >= num_sectors) {
-             DEBUG_PRINTF("Format Track Error: interleave %d is invalid for num_sectors %u\n",
-                interleave, num_sectors);
-            return IMDF_ERR_INVALID_ARG;
-        }
-        if (interleave < 1) {
-            DEBUG_PRINTF("Format Track Error: interleave %d must be >= 1\n", interleave);
-            return IMDF_ERR_INVALID_ARG;
-        }
-    }
-    if (skew < 0 || skew >= num_sectors) {
-        DEBUG_PRINTF("Format Track Error: skew %d is invalid for num_sectors %u\n",
-            skew, num_sectors);
+    if (mode >= LIBIMD_NUM_MODES || num_sectors > LIBIMD_MAX_SECTORS_PER_TRACK ||
+        get_sector_size_code(sector_size, &sector_size_code) != 0 ||
+        (num_sectors > 0 && (first_sector_id == 0 || first_sector_id > num_sectors)) ||
+        (interleave < 1 || (num_sectors > 1 && interleave >= num_sectors)) ||
+        (skew < 0 || skew >= num_sectors)) {
         return IMDF_ERR_INVALID_ARG;
     }
 
-    /* Generate the sector smap */
+    /*
+     * 2. Generate the sector map, which is the core logic of this function.
+     */
     if (num_sectors > 0) {
         generate_formatted_smap(generated_smap, num_sectors, first_sector_id, interleave, skew);
     }
 
-    track_idx_int = find_track_index_internal(imdf, cyl, head);
-    existing_track = (track_idx_int >= 0);
-
-    if (existing_track) {
-        insert_idx = (size_t)track_idx_int;
-        DEBUG_PRINTF("Format Track: Overwriting existing track at index %zu (C%u H%u)\n",
-            insert_idx, cyl, head);
-        track_ptr = &imdf->tracks[insert_idx];
-        imd_free_track_data(track_ptr); /* Free old data if any */
-        memset(track_ptr, 0, sizeof(ImdTrackInfo)); /* Clear structure */
-    } else {
-        DEBUG_PRINTF("Format Track: Creating new track for C%u H%u\n", cyl, head);
-        insert_idx = find_insertion_index(imdf, cyl, head);
-
-        if (imdf->num_tracks >= imdf->track_capacity) {
-            size_t new_capacity = (imdf->track_capacity == 0) ?
-                                  IMDF_INITIAL_TRACK_CAPACITY : imdf->track_capacity * 2;
-            if (new_capacity <= imdf->track_capacity) { /* Overflow check */
-                result = IMDF_ERR_ALLOC;
-                goto cleanup_error;
-            }
-            ImdTrackInfo* new_tracks = (ImdTrackInfo*)realloc(imdf->tracks,
-                                                             new_capacity * sizeof(ImdTrackInfo));
-            if (!new_tracks) {
-                result = IMDF_ERR_ALLOC;
-                goto cleanup_error;
-            }
-            imdf->tracks = new_tracks;
-            imdf->track_capacity = new_capacity;
-            DEBUG_PRINTF("Format Track: Reallocated track array to %zu\n", new_capacity);
-        }
-
-        /* Make space for the new track if inserting in the middle */
-        if (insert_idx < imdf->num_tracks) {
-            memmove(&imdf->tracks[insert_idx + 1],
-                    &imdf->tracks[insert_idx],
-                    (imdf->num_tracks - insert_idx) * sizeof(ImdTrackInfo));
-        }
-
-        track_ptr = &imdf->tracks[insert_idx];
-        memset(track_ptr, 0, sizeof(ImdTrackInfo));
-        imdf->num_tracks++;
-    }
-
-    /* Populate the track structure */
-    track_ptr->cyl = cyl;
-    track_ptr->head = head;
-    track_ptr->mode = mode;
-    track_ptr->num_sectors = num_sectors;
-    track_ptr->sector_size_code = sector_size_code;
-    track_ptr->sector_size = sector_size; /* Will be set by imd_alloc_track_data too */
-    track_ptr->loaded = 1; /* Mark as loaded and ready to be written */
-    track_ptr->hflag = 0;  /* No optional cmap/hmap for a basic format */
-
-    if (num_sectors > 0) {
-        int alloc_res = imd_alloc_track_data(track_ptr);
-        if (alloc_res != 0) {
-            result = map_libimd_error(alloc_res);
-            goto cleanup_error;
-        }
-        memset(track_ptr->data, fill_byte, track_ptr->data_size);
-        memcpy(track_ptr->smap, generated_smap, num_sectors);
-
-        /* Fill default cmap and hmap (will not be written unless flags are set) */
-        for (uint8_t i = 0; i < num_sectors; ++i) {
-            track_ptr->cmap[i] = cyl;
-            track_ptr->hmap[i] = head;
-            track_ptr->sflag[i] = IMD_SDR_NORMAL; /* Default, will be adjusted by imd_write_track_imd */
-        }
-    } else {
-        track_ptr->data = NULL;
-        track_ptr->data_size = 0;
-    }
-
-    /* Prepare write options. Force compression will check if fill_byte made sectors uniform. */
-    ImdWriteOpts write_opts;
-    memcpy(&write_opts, &default_libimdf_write_opts, sizeof(ImdWriteOpts));
-    write_opts.compression_mode = IMD_COMPRESSION_FORCE_COMPRESS;
-    /* The interleave_factor in ImdWriteOpts is for libimd's re-interleaving,
-       which we don't want here as we've already built the specific smap.
-       So, use LIBIMD_IL_AS_READ. */
-    write_opts.interleave_factor = LIBIMD_IL_AS_READ;
-
-
-    rewrite_res = rewrite_image_file(imdf, insert_idx, &write_opts);
-    if (rewrite_res != IMDF_ERR_OK) {
-        result = rewrite_res;
-        goto cleanup_error;
-    }
-
-    /* After successful rewrite, update the in-memory sflag for the written track */
-    /* This is a prediction based on the fill_byte and FORCE_COMPRESS option */
-    if (num_sectors > 0 && track_ptr->data) {
-        uint8_t predicted_sdr_type = IMD_SDR_COMPRESSED; /* Assume fill_byte makes it compressible */
-        /* Check if all data is actually the fill_byte. If not, it's normal. */
-        for(size_t k=0; k < track_ptr->data_size; ++k) {
-            if(track_ptr->data[k] != fill_byte) {
-                predicted_sdr_type = IMD_SDR_NORMAL;
-                break;
-            }
-        }
-        for (uint8_t i = 0; i < track_ptr->num_sectors; ++i) {
-            track_ptr->sflag[i] = predicted_sdr_type;
-        }
-    }
-
-    return IMDF_ERR_OK;
-
-cleanup_error:
-    DEBUG_PRINTF("Format Track: Cleaning up after error %d during %s track\n",
-        result, existing_track ? "overwrite of" : "insertion of new");
-    /* If it was a new track that failed, remove it from the array */
-    if (!existing_track && track_ptr == &imdf->tracks[insert_idx]) {
-        imd_free_track_data(track_ptr); /* Free data if allocated for the new track */
-        if (insert_idx < imdf->num_tracks -1 ) { /* Check if it's not the last element before moving */
-             memmove(&imdf->tracks[insert_idx],
-                    &imdf->tracks[insert_idx + 1],
-                    (imdf->num_tracks - 1 - insert_idx) * sizeof(ImdTrackInfo));
-        }
-        imdf->num_tracks--;
-    } else if (existing_track && track_ptr) {
-        /* If overwriting an existing track failed, its state might be partial.
-           Best to re-load or close/re-open the image.
-           For now, its data is freed and struct zeroed. It might be an empty shell.
-        */
-        DEBUG_PRINTF("Format Track: Overwrite for C%u H%u failed. In-memory track is now empty/cleared.\n",
-            cyl, head);
-    }
-    return result;
+    /*
+     * 3. Delegate track creation and file writing to the modified imdf_write_track.
+     */
+    return imdf_write_track(imdf,
+                            cyl,
+                            head,
+                            mode, /* Pass the mode parameter through. */
+                            num_sectors,
+                            sector_size,
+                            fill_byte,
+                            (num_sectors > 0) ? generated_smap : NULL,
+                            NULL, /* cmap is not generated by format. */
+                            NULL  /* hmap is not generated by format. */
+                            );
 }

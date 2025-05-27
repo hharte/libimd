@@ -57,6 +57,18 @@ typedef struct ImdImageFile ImdImageFile; /* Opaque structure */
 int imdf_open(const char* path, int read_only, ImdImageFile** imdf_out);
 
 /**
+ * Opens an IMD image from an existing file stream and loads its structure into memory.
+ * The stream must be seekable. The caller retains ownership of the file stream
+ * and is responsible for closing it.
+ *
+ * @param f The file stream to read from. It will be rewound before reading.
+ * @param read_only If non-zero, prevents modifications to the image.
+ * @param imdf_out Pointer to store the allocated ImdImageFile handle on success.
+ * @return IMDF_ERR_OK on success, negative IMDF_ERR_* code on failure.
+ */
+int imdf_open_from_file(FILE* f, int read_only, ImdImageFile** imdf_out);
+
+/**
  * Closes an open IMD image file, frees all associated memory, and closes the file handle.
  * @param imdf Pointer to the ImdImageFile handle obtained from imdf_open. Can be NULL.
  */
@@ -207,6 +219,7 @@ int imdf_write_sector(ImdImageFile* imdf, uint8_t cyl, uint8_t head, uint8_t log
  * @param imdf Pointer to the ImdImageFile handle.
  * @param cyl Cylinder number for the track.
  * @param head Head number for the track.
+ * @param mode The IMD mode for this track (e.g., IMD_MODE_MFM_250).
  * @param num_sectors Number of sectors for the new/updated track (0-255).
  * @param sector_size Size in bytes for each sector (must be a valid IMD size like 128, 256, etc.).
  * @param fill_byte Byte value used to fill the data buffer for all sectors.
@@ -228,12 +241,13 @@ int imdf_write_sector(ImdImageFile* imdf, uint8_t cyl, uint8_t head, uint8_t log
 int imdf_write_track(ImdImageFile* imdf,
                      uint8_t cyl,
                      uint8_t head,
+                     uint8_t mode,
                      uint8_t num_sectors,
                      uint32_t sector_size,
                      uint8_t fill_byte,
                      const uint8_t* smap,
-                     const uint8_t* cmap, /* Added */
-                     const uint8_t* hmap  /* Added */
+                     const uint8_t* cmap,
+                     const uint8_t* hmap
                      );
 
 /**
